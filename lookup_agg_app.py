@@ -345,7 +345,7 @@ def validate(configs):
 # ----------------------------------------------------------------------------
 # Main page
 # ----------------------------------------------------------------------------
-st.title("Lookup & Aggregation Tool")                     # page title
+st.title("🧮 Formula X - Lookup & Aggregation Tool")                     # page title
 
 up_l, up_r = st.columns(2)                                # two upload areas side by side
 with up_l:
