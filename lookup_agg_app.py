@@ -348,10 +348,10 @@ st.title("🧮 Formula X - Lookup & Aggregation Tool", text_alignment="center") 
 
 up_l, up_r = st.columns(2)                                # two upload areas side by side
 with up_l:
-    f_left = st.file_uploader("Upload File for Left Table", type=["csv", "xlsx", "xlsm", "xls"], key="up_left")
+    f_left = st.file_uploader("Upload File for Left Table (Add New Columns Here)", type=["csv", "xlsx", "xlsm", "xls"], key="up_left")
     left_df = pick_table("Left table", f_left, "sheet_left")   # sheet dropdown + parse
 with up_r:
-    f_right = st.file_uploader("Upload File for Right Table", type=["csv", "xlsx", "xlsm", "xls"], key="up_right")
+    f_right = st.file_uploader("Upload File for Right Table (Source Data for Lookup)", type=["csv", "xlsx", "xlsm", "xls"], key="up_right")
     right_df = pick_table("Right table", f_right, "sheet_right")
 
 if left_df is None:                                       # left table is mandatory
