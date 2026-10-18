@@ -1,0 +1,30 @@
+name: Keep Formula X Awake
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'   # Runs daily at 9:00 AM UTC — adjust as needed
+  workflow_dispatch:        # Allows manual trigger from GitHub UI
+
+jobs:
+  selenium:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install selenium
+
+      - name: Install Chrome and ChromeDriver
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Keep Formula X Awake
+        run: |
+          python your_script.py
