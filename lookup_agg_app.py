@@ -6,13 +6,14 @@ Install : pip install streamlit pandas openpyxl xlrd
 Run     : streamlit run lookup_agg_app.py
 """
 
+import re                                     # used to translate Excel-style date formats
 import uuid                                   # used to build random "NA" placeholder tokens
 from io import BytesIO                        # in-memory file buffer (for reading uploads / writing Excel)
 
 import pandas as pd                           # all the data work
 import streamlit as st                        # the UI
 
-st.set_page_config(page_title="Lookup & Aggregation Tool", layout="wide")  # wide layout so columns fit
+st.set_page_config(page_title="🧮 Formula X - Lookup & Aggregation Tool", layout="wide")  # wide layout so columns fit
 
 BASIC_AGGS = ["max", "sum", "min", "count"]               # plain aggregations (no second table needed)
 LOOKUP_AGGS = ["sumifs", "countifs", "xlookup"]           # aggregations that use the right table
@@ -139,11 +140,73 @@ def smart_sort_key(s: pd.Series) -> pd.Series:
     return num if num.notna().sum() == s.notna().sum() else s  # use numbers only if nothing was lost
 
 
+# ---- Date / datetime support for the xlookup "sort" column ----
+CUSTOM_FMT = "Custom..."                                  # dropdown entry that reveals a manual format box
+DATE_FORMATS = [                                          # Excel-style presets shown in the dropdown
+    "dd/mm/yyyy", "mm/dd/yyyy", "yyyy-mm-dd", "dd-mm-yyyy", "dd-mmm-yyyy", "d-mmm-yy", "dd mmmm yyyy",
+    "dd/mm/yyyy hh:mm", "dd/mm/yyyy hh:mm:ss", "mm/dd/yyyy hh:mm AM/PM", "mm/dd/yyyy hh:mm:ss AM/PM",
+    "yyyy-mm-dd hh:mm:ss", "yyyy-mm-dd hh:mm:ss.000", "dd-mmm-yyyy hh:mm:ss",
+]
+EXCEL_TOKEN_RE = re.compile(r"yyyy|yy|mmmm|mmm|mm|m|dddd|ddd|dd|d|hh|h|ss|s|AM/PM|\.0+", re.I)  # Excel format pieces
+TOKEN_MAP = {                                             # Excel token -> Python strptime directive
+    "yyyy": "%Y", "yy": "%y", "mmmm": "%B", "mmm": "%b", "dddd": "%A", "ddd": "%a",
+    "dd": "%d", "d": "%d", "ss": "%S", "s": "%S", "am/pm": "%p",
+}
+
+
+def excel_to_strptime(fmt: str) -> str:
+    """Translate an Excel-style format (dd/mm/yyyy hh:mm:ss) into a Python one (%d/%m/%Y %H:%M:%S).
+    A format that already contains '%' is assumed to be Python-style and is returned unchanged."""
+    if "%" in fmt:                                        # user typed a Python format directly
+        return fmt
+    tokens = list(EXCEL_TOKEN_RE.finditer(fmt))           # every date/time piece found in the format
+    has_ampm = any(t.group(0).lower() == "am/pm" for t in tokens)  # 12-hour clock if AM/PM is present
+    out, last = [], 0                                     # output pieces + end of the previous token
+    for idx, m in enumerate(tokens):                      # walk through the tokens in order
+        out.append(fmt[last:m.start()])                   # keep the separators between tokens as they are
+        low = m.group(0).lower()                          # token in lowercase for comparisons
+        if low in ("m", "mm"):                            # Excel uses "mm" for BOTH month and minute
+            prev_hour = idx > 0 and tokens[idx - 1].group(0).lower() in ("h", "hh")   # right after hours -> minutes
+            next_sec = idx + 1 < len(tokens) and tokens[idx + 1].group(0).lower() in ("s", "ss")  # right before seconds -> minutes
+            out.append("%M" if (prev_hour or next_sec) else "%m")  # minute or month
+        elif low in ("h", "hh"):                          # hours
+            out.append("%I" if has_ampm else "%H")        # 12-hour or 24-hour
+        elif low.startswith("."):                         # ".000" -> fractional seconds
+            out.append(".%f")
+        else:                                             # all remaining tokens come from the lookup table
+            out.append(TOKEN_MAP[low])
+        last = m.end()                                    # remember where this token ended
+    out.append(fmt[last:])                                # trailing literal text
+    return "".join(out)                                   # final Python format string
+
+
+def parse_dates(s: pd.Series, fmt: str, col: str) -> pd.Series:
+    """Convert a column to datetimes using `fmt`; raise ValueError if any non-blank value does not fit."""
+    if pd.api.types.is_datetime64_any_dtype(s):           # already real datetimes (e.g. from Excel) -> nothing to parse
+        return s
+    py_fmt = excel_to_strptime(fmt)                       # Excel-style -> Python-style
+    txt = s.astype("string").str.strip()                  # work on clean text
+    if "%f" in py_fmt:                                    # format has fractional seconds
+        txt = txt.str.replace(r"(\.\d{6})\d+", r"\1", regex=True)  # cut nanosecond digits beyond 6 (not an error)
+    else:                                                 # format has no fractional seconds
+        txt = txt.str.replace(r"(?<=:\d{2})\.\d+", "", regex=True)   # ignore ".123" after seconds (not an error)
+    parsed = pd.to_datetime(txt, format=py_fmt, errors="coerce")  # unparseable values become NaT
+    bad = parsed.isna() & txt.notna() & (txt.str.len() > 0)       # non-blank values that failed
+    if bad.any():                                         # stop and tell the user exactly what failed
+        examples = ", ".join(repr(v) for v in txt[bad].unique()[:5])  # first few offending values
+        raise ValueError(f"Sort column '{col}': {int(bad.sum())} value(s) do not match the date format "
+                         f"'{fmt}' (e.g. {examples}). Pick another format or fix the column.")
+    return parsed                                         # clean datetime column
+
+
 def apply_xlookup(left, right, cfg):
     lkey, rkey = build_keys(left, right, cfg["pairs"])    # matching keys
     r = right.copy()                                      # work on a copy of the right table
     r["_key"] = rkey                                      # attach the key to each right row
-    if cfg["sort"] != NO_SORT:                            # sort only if a sort column was chosen
+    if cfg["sort"] != NO_SORT and cfg.get("is_date"):     # sort column is a date/datetime
+        r["_sort"] = parse_dates(r[cfg["sort"]], cfg["date_fmt"], cfg["sort"])  # convert text -> datetime (or raise)
+        r = r.sort_values("_sort", ascending=cfg["asc"], kind="stable", na_position="last")  # sort by real dates
+    elif cfg["sort"] != NO_SORT:                          # normal (non-date) sort column
         r = r.sort_values(cfg["sort"], ascending=cfg["asc"], key=smart_sort_key,
                           kind="stable", na_position="last")  # best row ends up first
     r = r.drop_duplicates("_key", keep="first")           # keep ONE row per key (the first after sorting)
@@ -249,6 +312,18 @@ def render_block(i, left_cols, right_cols, taken):
         order = o[0].radio("Sorting order (first row kept)", ["Ascending", "Descending"], key=f"ord_{i}", horizontal=True)
         cfg["asc"] = order == "Ascending"
         cfg["not_found"] = o[1].text_input("If not found, show", "#N/A", key=f"nf_{i}")
+        cfg["is_date"] = False                            # default: not a date column
+        if cfg["sort"] != NO_SORT:                        # the checkbox only appears once a sort column is picked
+            cfg["is_date"] = o[2].checkbox("Sort column is a date/datetime", key=f"isdate_{i}")
+        if cfg["is_date"]:                                # format pickers appear only when ticked
+            d = st.columns(4)                             # one compact row
+            choice = d[0].selectbox("Date format (Excel style)", DATE_FORMATS + [CUSTOM_FMT], key=f"dfmt_{i}")
+            if choice == CUSTOM_FMT:                      # user wants to type their own format
+                fmt = d[1].text_input("Custom format", key=f"cfmt_{i}", placeholder="dd/mm/yyyy hh:mm:ss",
+                                      help="Excel style (yyyy mm dd hh mm ss AM/PM, .000) or Python style (%d/%m/%Y %H:%M:%S).")
+            else:
+                fmt = choice                              # use the preset
+            cfg["date_fmt"] = fmt.strip()                 # store the chosen format
 
     base = f"{agg}_" + "_".join(f"{s}_{l}" for s, l in pairs)  # suggested name from search + lookup columns
     base = base[:60]                                      # trim very long names
@@ -262,6 +337,8 @@ def validate(configs):
     for k, cfg in enumerate(configs, 1):
         if cfg["agg"] in BASIC_AGGS and cfg["mode"] == "row" and len(cfg["cols"]) < 2:
             errors.append(f"Aggregation #{k}: pick at least 2 columns for row-wise.")
+        if cfg["agg"] == "xlookup" and cfg.get("is_date") and not cfg.get("date_fmt"):
+            errors.append(f"Aggregation #{k}: enter a date format for the sort column.")
     return errors
 
 
@@ -303,9 +380,13 @@ if st.button("Generate", type="primary"):                 # run everything
         for p in problems:
             st.error(p)
     else:
-        with st.spinner("Calculating..."):
-            out_df, xlsx_bytes, scalars = run_all(left_df, right_df, configs)
-        st.session_state["result"] = {"df": out_df, "xlsx": xlsx_bytes, "scalars": scalars}  # keep across reruns
+        try:                                              # date-format problems raise ValueError
+            with st.spinner("Calculating..."):
+                out_df, xlsx_bytes, scalars = run_all(left_df, right_df, configs)
+            st.session_state["result"] = {"df": out_df, "xlsx": xlsx_bytes, "scalars": scalars}  # keep across reruns
+        except ValueError as e:                           # show the message in the UI
+            st.session_state.pop("result", None)          # drop any stale result
+            st.error(str(e))
 
 res = st.session_state.get("result")                      # show last result (survives download-button reruns)
 if res:
