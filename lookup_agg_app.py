@@ -308,19 +308,18 @@ def render_block(i, left_cols, right_cols, taken):
     cfg["pairs"] = pairs
 
     if agg == "xlookup":                                  # extra xlookup options
-        o = st.columns(4)
-        order = o[0].radio("Sorting order (first row kept)", ["Ascending", "Descending"], key=f"ord_{i}", horizontal=True)
-        cfg["asc"] = order == "Ascending"
-        cfg["not_found"] = o[1].text_input("If not found, show", "#N/A", key=f"nf_{i}")
+        o = st.columns(4, vertical_alignment="bottom")    # one row; widgets line up on their bottom edge
+        order = o[0].selectbox("Sorting order (first row kept)", ["Ascending", "Descending"], key=f"ord_{i}")  # same height as the other inputs
+        cfg["asc"] = order == "Ascending"                 # True = ascending
+        cfg["not_found"] = o[1].text_input("If not found, show", "#N/A", key=f"nf_{i}")  # text for unmatched rows
         cfg["is_date"] = False                            # default: not a date column
         if cfg["sort"] != NO_SORT:                        # the checkbox only appears once a sort column is picked
-            cfg["is_date"] = o[2].checkbox("Sort column is a date/datetime", key=f"isdate_{i}")
-        if cfg["is_date"]:                                # format pickers appear only when ticked
-            d = st.columns(4)                             # one compact row
-            choice = d[0].selectbox("Date format (Excel style)", DATE_FORMATS + [CUSTOM_FMT], key=f"dfmt_{i}")
-            if choice == CUSTOM_FMT:                      # user wants to type their own format
-                fmt = d[1].text_input("Custom format", key=f"cfmt_{i}", placeholder="dd/mm/yyyy hh:mm:ss",
-                                      help="Excel style (yyyy mm dd hh mm ss AM/PM, .000) or Python style (%d/%m/%Y %H:%M:%S).")
+            cfg["is_date"] = o[2].checkbox("Sort column is a date/datetime", key=f"isdate_{i}")  # sits in the same row
+        if cfg["is_date"]:                                # format picker appears in the last slot of the SAME row
+            choice = o[3].selectbox("Date format (Excel style)", DATE_FORMATS + [CUSTOM_FMT], key=f"dfmt_{i}")
+            if choice == CUSTOM_FMT:                      # only when "Custom..." is picked, one extra box appears below it
+                fmt = st.columns(4)[3].text_input("Custom format", key=f"cfmt_{i}", placeholder="dd/mm/yyyy hh:mm:ss",
+                                                  help="Excel style (yyyy mm dd hh mm ss AM/PM, .000) or Python style (%d/%m/%Y %H:%M:%S).")
             else:
                 fmt = choice                              # use the preset
             cfg["date_fmt"] = fmt.strip()                 # store the chosen format
