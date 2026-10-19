@@ -16,6 +16,12 @@ import streamlit as st                        # the UI
 
 st.set_page_config(page_title="🧮 Formula X - Lookup & Aggregation Tool", layout="wide")  # wide layout so columns fit
 
+
+def blue_divider():
+    """Horizontal line in blue (st.divider() has no colour option, so a styled <hr> is used)."""
+    st.markdown('<hr style="border:0; border-top:2px solid #1E88E5; margin:1rem 0;">', unsafe_allow_html=True)  # blue line
+
+
 BASIC_AGGS = ["max", "sum", "min", "count"]               # plain aggregations (no second table needed)
 LOOKUP_AGGS = ["sumifs", "countifs", "xlookup"]           # aggregations that use the right table
 ALL_AGGS = BASIC_AGGS + LOOKUP_AGGS                       # full dropdown list
@@ -402,6 +408,7 @@ def validate(configs):
 # Main page
 # ----------------------------------------------------------------------------
 st.title("🧮 Formula X - Lookup & Aggregation Tool")      # page title
+blue_divider()                                           # blue line under the title
 
 ss = st.session_state                                     # short alias for the session state
 for _k, _v in {"stages": [], "saved_left": None, "seg": 0, "n_saved": 0, "left_id": None, "flash": None}.items():
@@ -517,7 +524,7 @@ base_cols = list(ss["saved_left"].columns) if ss["saved_left"] is not None else 
 
 configs, taken, i = [], list(base_cols), 0                # `taken` = left columns + generated ones so far
 while True:                                               # keep drawing blocks while "add another" is ticked
-    st.divider()
+    blue_divider()
     uid = ss["seg"] * 100 + i                             # unique widget id (changes after every saved step)
     available_left = list(taken)                          # left columns usable in this block (incl. generated)
     cfg = render_block(uid, available_left, right_cols, taken)
@@ -526,7 +533,7 @@ while True:                                               # keep drawing blocks 
         break                                             # stop when the box is not ticked
     i += 1
 
-st.divider()
+blue_divider()
 b1, b2, _ = st.columns([1, 1, 4])                         # two buttons side by side
 save_clicked = b1.button("💾 Save step", help="Run the aggregations above and keep the result, so you can swap the right table and continue.")
 gen_clicked = b2.button("Generate", type="primary", help="Run everything and build the Excel file.")
