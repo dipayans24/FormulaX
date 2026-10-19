@@ -18,8 +18,8 @@ st.set_page_config(page_title="🧮 Formula X - Lookup & Aggregation Tool", layo
 
 
 def blue_divider():
-    """Horizontal line in blue (st.divider() has no colour option, so a styled <hr> is used)."""
-    st.markdown('<hr style="border:0; border-top:2px solid #1E88E5; margin:1rem 0;">', unsafe_allow_html=True)  # blue line
+    """Horizontal line in blue (st.divider() has no colour option, so a coloured <div> bar is used)."""
+    st.markdown('<div style="height:3px; width:100%; background-color:#1E88E5; margin:1rem 0;"></div>', unsafe_allow_html=True)  # a 3px tall blue bar (a plain div renders more reliably than <hr>)
 
 
 BASIC_AGGS = ["max", "sum", "min", "count"]               # plain aggregations (no second table needed)
