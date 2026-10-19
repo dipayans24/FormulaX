@@ -6,6 +6,7 @@ Install : pip install streamlit pandas openpyxl xlrd
 Run     : streamlit run lookup_agg_app.py
 """
 
+import time                                   # used for the elapsed-time messages
 import re                                     # used to translate Excel-style date formats
 import uuid                                   # used to build random "NA" placeholder tokens
 from io import BytesIO                        # in-memory file buffer (for reading uploads / writing Excel)
@@ -23,40 +24,67 @@ NO_SORT = "(none - keep file order)"                      # dropdown label meani
 
 
 # ----------------------------------------------------------------------------
-# File reading helpers
+# File reading helpers (headers are read first, the full data only when really needed)
 # ----------------------------------------------------------------------------
-@st.cache_data(show_spinner=False)                        # cache so reruns don't re-read the file
-def list_sheets(data: bytes, filename: str):
-    if filename.lower().endswith(".csv"):                 # CSV files have no sheets
+def file_key(uploaded):
+    """Cheap identity of an upload, used as the cache key (avoids hashing the whole file on every rerun)."""
+    return (uploaded.name, uploaded.size, getattr(uploaded, "file_id", None))  # name + size + upload id
+
+
+@st.cache_data(show_spinner=False)                        # cache sheet names per file
+def list_sheets(_data, fkey):                             # `_data` (leading underscore) is NOT hashed by streamlit
+    if fkey[0].lower().endswith(".csv"):                  # CSV files have no sheets
         return []                                         # empty list = "no sheet choice needed"
-    return pd.ExcelFile(BytesIO(data)).sheet_names        # for Excel, return all sheet names
+    return pd.ExcelFile(BytesIO(_data)).sheet_names       # for Excel, return all sheet names
 
 
-@st.cache_data(show_spinner=False)                        # cache the parsed table
-def read_table(data: bytes, filename: str, sheet):
-    if filename.lower().endswith(".csv"):                 # decide reader using the file extension
+@st.cache_data(show_spinner=False)                        # cache the header row per file + sheet
+def read_headers(_data, fkey, sheet):
+    """Read ONLY the header row (0 data rows) - enough to fill the dropdowns."""
+    if fkey[0].lower().endswith(".csv"):                  # decide the reader using the file extension
         try:
-            df = pd.read_csv(BytesIO(data))               # try the default utf-8 first
+            df = pd.read_csv(BytesIO(_data), nrows=0)     # header only
         except UnicodeDecodeError:
-            df = pd.read_csv(BytesIO(data), encoding="latin-1")  # fall back for odd encodings
+            df = pd.read_csv(BytesIO(_data), nrows=0, encoding="latin-1")  # fall back for odd encodings
     else:
-        df = pd.read_excel(BytesIO(data), sheet_name=sheet)      # read the chosen sheet
+        df = pd.read_excel(BytesIO(_data), sheet_name=sheet, nrows=0)      # header only
+    return [str(c) for c in df.columns]                   # column names as text
+
+
+@st.cache_resource(show_spinner=False, max_entries=3)     # keep the last few full tables (no copying; we never modify them)
+def read_table(_data, fkey, sheet, usecols=None):
+    """Read the full table. `usecols` = tuple of column POSITIONS to read (None = all columns)."""
+    cols = list(usecols) if usecols is not None else None  # pandas wants a list
+    if fkey[0].lower().endswith(".csv"):                  # CSV
+        try:
+            df = pd.read_csv(BytesIO(_data), usecols=cols)  # try the default utf-8 first
+        except UnicodeDecodeError:
+            df = pd.read_csv(BytesIO(_data), usecols=cols, encoding="latin-1")  # fall back for odd encodings
+    else:                                                 # Excel
+        df = pd.read_excel(BytesIO(_data), sheet_name=sheet, usecols=cols)     # read the chosen sheet
     df.columns = df.columns.astype(str)                   # make sure every column name is a string
     return df                                             # return the table
 
 
-def pick_table(label: str, uploaded, key: str):
-    """Show sheet dropdown (if needed) and return the DataFrame for an uploaded file."""
+def pick_source(label: str, uploaded, key: str):
+    """Show the sheet dropdown (if needed) and return a light-weight handle: file bytes + sheet + headers."""
     if uploaded is None:                                  # nothing uploaded yet
         return None
     data = uploaded.getvalue()                            # raw bytes of the upload
-    sheets = list_sheets(data, uploaded.name)             # sheet names (empty for csv)
+    fkey = file_key(uploaded)                             # cache key for this file
+    sheets = list_sheets(data, fkey)                      # sheet names (empty for csv)
     sheet = None                                          # default: no sheet (csv)
     if len(sheets) > 1:                                   # several sheets -> let the user choose
         sheet = st.selectbox(f"{label} - select sheet", sheets, key=key)
     elif len(sheets) == 1:                                # a single sheet -> use it directly
         sheet = sheets[0]
-    return read_table(data, uploaded.name, sheet)         # parse and return
+    headers = read_headers(data, fkey, sheet)             # only the column names are read here
+    return {"data": data, "fkey": fkey, "name": uploaded.name, "sheet": sheet, "headers": headers}
+
+
+def load_df(src, idx=None):
+    """Read the full table (optionally only the columns at positions `idx`) for a handle from pick_source."""
+    return read_table(src["data"], src["fkey"], src["sheet"], idx)
 
 
 # ----------------------------------------------------------------------------
@@ -216,37 +244,66 @@ def apply_xlookup(left, right, cfg):
     return result.where(found, cfg["not_found"])          # unmatched rows get the "not found" text
 
 
-def run_all(left, right, configs):
-    """Apply every configured aggregation in order and build the output workbook."""
+def right_cols_needed(configs):
+    """Right-table columns required by a list of aggregation configs (unique, in order of first use)."""
+    needed = []                                           # result list
+    for cfg in configs:                                   # go through every aggregation
+        if cfg["agg"] in LOOKUP_AGGS:                     # only lookup-type aggregations use the right table
+            cols = [p[1] for p in cfg["pairs"]]           # lookup columns
+            cols += [cfg["ret"]] if cfg.get("ret") else []  # return column
+            cols += [cfg["sort"]] if cfg.get("sort") not in (None, NO_SORT) else []  # sort column
+            for c in cols:                                # keep unique, keep order
+                if c not in needed:
+                    needed.append(c)
+    return needed                                         # list of column names
+
+
+def run_segment(left, right, configs, log=print):
+    """Apply the aggregations in order. Returns (output table, right columns used, column-wise scalars)."""
     out = left.copy()                                     # original left table stays untouched
-    used_right = []                                       # right-table columns used (for sheet 2)
     scalars = []                                          # axis=0 results to show in the UI
-    for cfg in configs:                                   # one pass per aggregation block
-        agg = cfg["agg"]
+    n = len(configs)                                      # how many aggregations in total
+    for k, cfg in enumerate(configs, 1):                  # one pass per aggregation block
+        t0 = time.perf_counter()                          # start timer for this block
+        agg = cfg["agg"]                                  # which aggregation
+        log(f"⚙️ [{k}/{n}] {agg} → new column '{cfg['name']}'")  # progress message
         if agg in BASIC_AGGS:                             # plain max/sum/min/count
             col, scalar = apply_basic(out, cfg)           # (uses earlier generated columns too)
             if scalar is not None:
                 scalars.append((cfg["name"], scalar))     # remember axis=0 result
         else:                                             # lookup-type aggregations need the right table
+            log(f"   matching {len(out):,} left rows against {len(right):,} right rows")
             if agg == "sumifs":
                 col = apply_sumifs(out, right, cfg)
             elif agg == "countifs":
                 col = apply_countifs(out, right, cfg)
             else:
                 col = apply_xlookup(out, right, cfg)
-            needed = [p[1] for p in cfg["pairs"]]         # lookup columns
-            needed += [cfg["ret"]] if cfg.get("ret") else []  # return column
-            needed += [cfg["sort"]] if cfg.get("sort") not in (None, NO_SORT) else []  # sort column
-            for c in needed:                              # collect unique, keep order
-                if c not in used_right:
-                    used_right.append(c)
         out[cfg["name"]] = col.values                     # add the new column at the far right
+        log(f"   ✔ done in {time.perf_counter() - t0:.2f}s")  # per-block timing
+    return out, right_cols_needed(configs), scalars       # table, used right columns, scalars
+
+
+def write_excel(out_df, stages, log=print):
+    """Build the Excel file: left table + new columns on sheet 1, raw used right columns on the next sheets."""
     buf = BytesIO()                                       # in-memory Excel file
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        out.to_excel(writer, sheet_name="Left_Output", index=False)          # sheet 1: left + new columns
-        if used_right:                                    # sheet 2: raw right columns that were used
-            right[used_right].to_excel(writer, sheet_name="Right_Used", index=False)
-    return out, buf.getvalue(), scalars
+    try:
+        import xlsxwriter                                 # noqa: F401  (much faster writer, if installed)
+        engine = "xlsxwriter"
+    except ImportError:
+        engine = "openpyxl"                               # slower, but always available
+    log(f"   writer engine: {engine}")                    # tell the user which engine is used
+    right_stages = [g for g in stages if g.get("right_used") is not None]  # stages that used a right table
+    with pd.ExcelWriter(buf, engine=engine) as writer:
+        out_df.to_excel(writer, sheet_name="Left_Output", index=False)  # sheet 1: left + new columns
+        for n, g in enumerate(right_stages, 1):           # one extra sheet per right table used
+            if len(right_stages) == 1:                    # a single right table keeps the simple name
+                name = "Right_Used"
+            else:                                         # several -> number + file name (max 31 chars, no illegal chars)
+                stem = re.sub(r"[\[\]:*?/\\]", "_", g["right_label"].rsplit(".", 1)[0])
+                name = f"R{n}_{stem}"[:31]
+            g["right_used"].to_excel(writer, sheet_name=name, index=False)  # raw right columns, no aggregation
+    return buf.getvalue()                                 # bytes ready for download
 
 
 # ----------------------------------------------------------------------------
@@ -273,7 +330,7 @@ def name_box(i, base, taken, container):
 
 def render_block(i, left_cols, right_cols, taken):
     """Draw the widgets for aggregation #i and return its config dict."""
-    st.markdown(f"#### Aggregation #{i + 1}")             # block heading
+    st.markdown(f"#### Aggregation #{st.session_state.get('n_saved', 0) + i % 100 + 1}")  # numbering continues after saved steps
     agg = st.selectbox("Select agg", ALL_AGGS, key=f"agg_{i}")  # which aggregation
     cfg = {"agg": agg}                                    # config being built
 
@@ -344,50 +401,143 @@ def validate(configs):
 # ----------------------------------------------------------------------------
 # Main page
 # ----------------------------------------------------------------------------
-st.title("🧮 Formula X - Lookup & Aggregation Tool", text_alignment="center")                     # page title
+st.title("🧮 Formula X - Lookup & Aggregation Tool")      # page title
+
+ss = st.session_state                                     # short alias for the session state
+for _k, _v in {"stages": [], "saved_left": None, "seg": 0, "n_saved": 0, "left_id": None, "flash": None}.items():
+    ss.setdefault(_k, _v)                                 # create the state keys on the first run
+
+
+def reset_steps():
+    """Forget all saved steps (also resets the aggregation widgets by changing their key prefix)."""
+    ss["stages"] = []                                     # no saved steps
+    ss["saved_left"] = None                               # go back to the original left table
+    ss["n_saved"] = 0                                     # numbering restarts
+    ss["seg"] += 1                                        # new widget keys -> fresh blocks
+    ss.pop("result", None)                                # drop any old output
+
+
+def process(configs, left_src, right_src, commit):
+    """Run the current aggregations. commit=True -> 'Save step'; commit=False -> 'Generate' (writes the Excel)."""
+    active = [c for c in configs if not (c["agg"] in BASIC_AGGS and c["mode"] == "row" and not c["cols"])]  # ignore untouched empty blocks
+    problems = validate(active)                           # basic checks first
+    if any(c["agg"] in LOOKUP_AGGS for c in active) and right_src is None:
+        problems.append("Upload the right table - it is needed for sumifs/countifs/xlookup.")
+    if not active and (commit or not ss["stages"]):       # nothing to save / generate
+        problems.append("Nothing to do yet - configure at least one aggregation.")
+    if problems:                                          # stop and show every problem
+        for msg in problems:
+            st.error(msg)
+        return False
+    t_all = time.perf_counter()                           # total timer
+    with st.status("Processing...", expanded=True) as status:  # live progress box
+        try:
+            if ss["saved_left"] is not None:              # earlier steps were saved -> start from that table
+                left_df = ss["saved_left"]
+                st.write(f"📋 Using the saved table ({len(left_df):,} rows × {left_df.shape[1]} columns) - left file not re-read.")
+            else:                                         # first step -> read the full left file now
+                st.write("📥 Reading the full left table...")
+                t = time.perf_counter()
+                left_df = load_df(left_src)
+                st.write(f"   ✔ {len(left_df):,} rows × {left_df.shape[1]} columns in {time.perf_counter() - t:.1f}s")
+            right_df = None                               # right table only if a lookup aggregation needs it
+            needed = right_cols_needed(active)            # right columns required by this step
+            if needed:
+                idx = tuple(right_src["headers"].index(c) for c in needed)  # their positions in the file
+                st.write(f"📥 Reading the right table - only {len(needed)} column(s): {', '.join(needed)}")
+                t = time.perf_counter()
+                right_df = load_df(right_src, idx)        # read just those columns
+                st.write(f"   ✔ {len(right_df):,} rows in {time.perf_counter() - t:.1f}s")
+            if active:                                    # run the aggregations
+                out_df, used, scalars = run_segment(left_df, right_df, active, log=st.write)
+            else:                                         # Generate with nothing new: just export what was saved
+                out_df, used, scalars = left_df, [], []
+            stage = None                                  # snapshot of this step (kept for the Excel's right sheets)
+            if active:
+                label = right_src["name"] + (f" [{right_src['sheet']}]" if right_src["sheet"] else "") if right_src else ""
+                stage = {"right_label": label, "right_used": right_df[used].copy() if used else None,
+                         "new_cols": [c["name"] for c in active], "scalars": scalars}
+            if commit:                                    # ---- Save step ----
+                ss["stages"].append(stage)                # remember the step
+                ss["saved_left"] = out_df                 # later steps build on this table
+                ss["seg"] += 1                            # fresh aggregation blocks
+                ss["n_saved"] += len(active)              # keep the numbering going
+                ss.pop("result", None)                    # old output is now outdated
+                ss["flash"] = (f"💾 Step {len(ss['stages'])} saved in {time.perf_counter() - t_all:.1f}s. "
+                               "Swap the right table if needed and add more aggregations. The Excel is written when you click Generate.")
+                status.update(label="Step saved", state="complete", expanded=False)
+            else:                                         # ---- Generate ----
+                all_stages = ss["stages"] + ([stage] if stage else [])  # saved steps + this one
+                st.write("📝 Writing the Excel file (can take a while for large tables)...")
+                t = time.perf_counter()
+                xlsx = write_excel(out_df, all_stages, log=st.write)
+                st.write(f"   ✔ Excel ready in {time.perf_counter() - t:.1f}s")
+                ss["result"] = {"df": out_df, "xlsx": xlsx, "scalars": [x for g in all_stages for x in g["scalars"]]}
+                status.update(label=f"Done in {time.perf_counter() - t_all:.1f}s", state="complete", expanded=False)
+        except Exception as e:                            # show any failure inside the status box
+            status.update(label="Failed", state="error", expanded=True)
+            st.error(str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}")
+            ss.pop("result", None)                        # drop a stale result
+            return False
+    return True
+
 
 up_l, up_r = st.columns(2)                                # two upload areas side by side
 with up_l:
-    f_left = st.file_uploader("Upload File for Left Table (Add New Columns Here)", type=["csv", "xlsx", "xlsm", "xls"], key="up_left")
-    left_df = pick_table("Left table", f_left, "sheet_left")   # sheet dropdown + parse
+    f_left = st.file_uploader("Upload File for Left Table", type=["csv", "xlsx", "xlsm", "xls"], key="up_left")
+    left_src = pick_source("Left table", f_left, "sheet_left")    # sheet dropdown + header row only
 with up_r:
-    f_right = st.file_uploader("Upload File for Right Table (Source Data for Lookup)", type=["csv", "xlsx", "xlsm", "xls"], key="up_right")
-    right_df = pick_table("Right table", f_right, "sheet_right")
+    f_right = st.file_uploader("Upload File for Right Table", type=["csv", "xlsx", "xlsm", "xls"], key="up_right")
+    right_src = pick_source("Right table", f_right, "sheet_right")
 
-if left_df is None:                                       # left table is mandatory
+if left_src is None:                                      # left table is mandatory
     st.info("Upload the left table to begin.")
     st.stop()
-needs_right = True                                        # right table is only needed for lookup-type aggs
-right_cols = list(right_df.columns) if right_df is not None else []  # right-table column list
 
-configs, taken, i = [], list(left_df.columns), 0          # `taken` = left columns + generated ones so far
+left_id = (left_src["fkey"], left_src["sheet"])           # identity of the chosen left table
+if ss["left_id"] != left_id:                              # a different left file/sheet -> saved steps no longer apply
+    reset_steps()
+    ss["left_id"] = left_id
+
+if ss["flash"]:                                           # one-time message after "Save step"
+    st.success(ss["flash"])
+    ss["flash"] = None
+
+if ss["stages"]:                                          # summary of the saved steps
+    with st.expander(f"✅ Saved steps ({len(ss['stages'])})"):
+        for n, g in enumerate(ss["stages"], 1):
+            src_txt = f" · right table: `{g['right_label']}`" if g["right_label"] else ""
+            st.markdown(f"**Step {n}**{src_txt} · new columns: {', '.join(g['new_cols'])}")
+        if st.button("Reset all saved steps"):            # start over from the original left file
+            reset_steps()
+            st.rerun()
+
+right_cols = list(right_src["headers"]) if right_src is not None else []  # right-table column list
+base_cols = list(ss["saved_left"].columns) if ss["saved_left"] is not None else list(left_src["headers"])  # left columns incl. saved ones
+
+configs, taken, i = [], list(base_cols), 0                # `taken` = left columns + generated ones so far
 while True:                                               # keep drawing blocks while "add another" is ticked
     st.divider()
+    uid = ss["seg"] * 100 + i                             # unique widget id (changes after every saved step)
     available_left = list(taken)                          # left columns usable in this block (incl. generated)
-    cfg = render_block(i, available_left, right_cols, taken)
+    cfg = render_block(uid, available_left, right_cols, taken)
     configs.append(cfg)
-    if not st.checkbox("Add another aggregation", key=f"more_{i}"):
+    if not st.checkbox("Add another aggregation", key=f"more_{uid}"):
         break                                             # stop when the box is not ticked
     i += 1
 
 st.divider()
-if st.button("Generate", type="primary"):                 # run everything
-    problems = validate(configs)                          # basic checks first
-    if any(c["agg"] in LOOKUP_AGGS for c in configs) and right_df is None:
-        problems.append("Upload the right table - it is needed for sumifs/countifs/xlookup.")
-    if problems:
-        for p in problems:
-            st.error(p)
-    else:
-        try:                                              # date-format problems raise ValueError
-            with st.spinner("Calculating..."):
-                out_df, xlsx_bytes, scalars = run_all(left_df, right_df, configs)
-            st.session_state["result"] = {"df": out_df, "xlsx": xlsx_bytes, "scalars": scalars}  # keep across reruns
-        except ValueError as e:                           # show the message in the UI
-            st.session_state.pop("result", None)          # drop any stale result
-            st.error(str(e))
+b1, b2, _ = st.columns([1, 1, 4])                         # two buttons side by side
+save_clicked = b1.button("💾 Save step", help="Run the aggregations above and keep the result, so you can swap the right table and continue.")
+gen_clicked = b2.button("Generate", type="primary", help="Run everything and build the Excel file.")
 
-res = st.session_state.get("result")                      # show last result (survives download-button reruns)
+if save_clicked:                                          # checkpoint: compute now, write the Excel later
+    if process(configs, left_src, right_src, commit=True):
+        st.rerun()                                        # refresh so the blocks reset for the next step
+if gen_clicked:                                           # final output
+    process(configs, left_src, right_src, commit=False)
+
+res = ss.get("result")                                    # show last result (survives download-button reruns)
 if res:
     st.success(f"Done: {len(res['df'])} rows, {res['df'].shape[1]} columns.")
     for name, value in res["scalars"]:                    # column-wise (axis=0) results
