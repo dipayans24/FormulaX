@@ -534,9 +534,17 @@ while True:                                               # keep drawing blocks 
     i += 1
 
 blue_divider()
-b1, b2, _ = st.columns([1, 1, 4])                         # two buttons side by side
-save_clicked = b1.button("💾 Save step", help="Run the aggregations above and keep the result, so you can swap the right table and continue.")
-gen_clicked = b2.button("Generate", type="primary", help="Run everything and build the Excel file.")
+def stretch_button(col, label, **kwargs):
+    """Button that fills its column (equal-width buttons); works on old and new Streamlit versions."""
+    try:
+        return col.button(label, width="stretch", **kwargs)              # newer Streamlit
+    except TypeError:
+        return col.button(label, use_container_width=True, **kwargs)     # older Streamlit
+
+
+b1, b2, _ = st.columns([1.4, 1.4, 7], gap="small")        # two equal, narrow button columns placed side by side on the left
+save_clicked = stretch_button(b1, "💾 Save step", help="Run the aggregations above and keep the result, so you can swap the right table and continue.")
+gen_clicked = stretch_button(b2, "Generate", type="primary", help="Run everything and build the Excel file.")
 
 if save_clicked:                                          # checkpoint: compute now, write the Excel later
     if process(configs, left_src, right_src, commit=True):
